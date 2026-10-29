@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:game/data.dart';
 import 'package:confetti/confetti.dart';
 import 'dart:math';
 import 'dart:async';
+import 'package:game/database/app_database.dart';
+import 'package:game/services/excel_service.dart';
+import 'package:game/screens/questions_page.dart';
 
 enum GameState { waiting, playing, gameOver }
 
@@ -17,6 +19,25 @@ class PlayerData {
   PlayerData();
 }
 
+enum WinLineType {
+  horizontal,
+  vertical,
+  mainDiagonal,
+  antiDiagonal,
+}
+
+class WinningLine {
+  final WinLineType type;
+  final int index;
+  final List<int> cellIndices;
+
+  WinningLine({
+    required this.type,
+    required this.index,
+    required this.cellIndices,
+  });
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -24,10 +45,12 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin {
   late ConfettiController _confettiController;
   Timer? _gameTimer;
   Timer? _displayTimer;
+  AnimationController? _lineAnimationController;
+  Animation<double>? _lineAnimation;
 
   // Game state
   GameState gameState = GameState.waiting;
@@ -40,7 +63,12 @@ class _HomePageState extends State<HomePage> {
   // Game board (5x5 = 25 cells)
   List<Player?> gameBoard = List.filled(25, null);
   Player? winner;
+  WinningLine? winningLine;
   String winMessage = '';
+
+  // Questions from Drift Database
+  List<Map<String, dynamic>> gameQuestions = [];
+  bool isLoadingQuestions = true;
 
   // Game duration
   int gameDuration = 0;
@@ -55,18 +83,62 @@ class _HomePageState extends State<HomePage> {
     _confettiController = ConfettiController(
       duration: const Duration(seconds: 2),
     );
+    _lineAnimationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    );
+    _lineAnimation = CurvedAnimation(
+      parent: _lineAnimationController!,
+      curve: Curves.easeInOutCubic,
+    );
+    _initDatabaseAndQuestions();
+  }
+
+  Future<void> _initDatabaseAndQuestions() async {
+    await ExcelService.seedDefaultQuestionsIfEmpty();
+    await _loadQuestionsFromDb();
     _startNewGame();
+  }
+
+  Future<void> _loadQuestionsFromDb() async {
+    final dbQuestions = await appDatabase.getAllQuestions();
+    setState(() {
+      gameQuestions = dbQuestions.map((q) => {
+        'id': q.id,
+        'question': q.question,
+        'answer': q.answerNumber == 1
+            ? q.optionA
+            : q.answerNumber == 2
+                ? q.optionB
+                : q.answerNumber == 3
+                    ? q.optionC
+                    : q.optionD,
+        'answerNumber': q.answerNumber,
+        'isAnswer': false,
+      }).toList();
+      isLoadingQuestions = false;
+    });
+  }
+
+  Future<void> _openQuestionsPage() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const QuestionsPage()),
+    );
+    await _loadQuestionsFromDb();
   }
 
   @override
   void dispose() {
     _confettiController.dispose();
+    _lineAnimationController?.dispose();
     _gameTimer?.cancel();
     _displayTimer?.cancel();
     super.dispose();
   }
 
   void _startNewGame() {
+    _lineAnimationController?.reset();
     setState(() {
       gameState = GameState.playing; // Start playing immediately
       currentPlayer = Player.player1;
@@ -74,12 +146,13 @@ class _HomePageState extends State<HomePage> {
       player2Data = PlayerData();
       gameBoard = List.filled(25, null);
       winner = null;
+      winningLine = null;
       winMessage = '';
       gameDuration = 0;
       remainingTime = gameTimeLimit;
 
       // Reset questions
-      for (var question in questions) {
+      for (var question in gameQuestions) {
         question["isAnswer"] = false;
       }
     });
@@ -198,7 +271,7 @@ class _HomePageState extends State<HomePage> {
     }
 
     // Get random question
-    final availableQuestions = questions
+    final availableQuestions = gameQuestions
         .where((q) => q["isAnswer"] == false)
         .toList();
     if (availableQuestions.isEmpty) {
@@ -208,7 +281,7 @@ class _HomePageState extends State<HomePage> {
 
     final randomQuestion =
         availableQuestions[Random().nextInt(availableQuestions.length)];
-    final questionIndex = questions.indexOf(randomQuestion);
+    final questionIndex = gameQuestions.indexOf(randomQuestion);
 
     // Show a brief message before the question
     ScaffoldMessenger.of(context).showSnackBar(
@@ -249,7 +322,7 @@ class _HomePageState extends State<HomePage> {
     Player player,
   ) {
     setState(() {
-      questions[questionIndex]["isAnswer"] = true;
+      gameQuestions[questionIndex]["isAnswer"] = true;
 
       if (selectedAnswer == correctAnswer) {
         // Correct answer - claim the cell
@@ -268,12 +341,15 @@ class _HomePageState extends State<HomePage> {
         _confettiController.play();
 
         // Check for win
-        if (_checkWin(player)) {
+        final win = _checkWin(player);
+        if (win != null) {
+          winningLine = win;
           winner = player;
           gameState = GameState.gameOver;
           winMessage = player == Player.player1
               ? 'اللاعب الأول فاز!'
               : 'اللاعب الثاني فاز!';
+          _lineAnimationController?.forward(from: 0.0);
           _stopGameTimer();
         } else if (_checkDraw()) {
           gameState = GameState.gameOver;
@@ -330,66 +406,67 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  bool _checkWin(Player player) {
+  WinningLine? _checkWin(Player player) {
     final playerCells = gameBoard
         .asMap()
         .entries
         .where((entry) => entry.value == player)
         .map((entry) => entry.key)
-        .toList();
+        .toSet();
 
     // Check for 5 in a row in any direction (horizontal, vertical, diagonal)
 
     // Check rows (horizontal)
     for (int row = 0; row < 5; row++) {
-      bool hasHorizontalWin = true;
-      for (int col = 0; col < 5; col++) {
-        if (!playerCells.contains(row * 5 + col)) {
-          hasHorizontalWin = false;
-          break;
-        }
+      final cells = List.generate(5, (col) => row * 5 + col);
+      if (cells.every((cell) => playerCells.contains(cell))) {
+        return WinningLine(
+          type: WinLineType.horizontal,
+          index: row,
+          cellIndices: cells,
+        );
       }
-      if (hasHorizontalWin) return true;
     }
 
     // Check columns (vertical)
     for (int col = 0; col < 5; col++) {
-      bool hasVerticalWin = true;
-      for (int row = 0; row < 5; row++) {
-        if (!playerCells.contains(row * 5 + col)) {
-          hasVerticalWin = false;
-          break;
-        }
+      final cells = List.generate(5, (row) => row * 5 + col);
+      if (cells.every((cell) => playerCells.contains(cell))) {
+        return WinningLine(
+          type: WinLineType.vertical,
+          index: col,
+          cellIndices: cells,
+        );
       }
-      if (hasVerticalWin) return true;
     }
 
     // Check main diagonal (top-left to bottom-right)
-    bool hasMainDiagonalWin = true;
-    for (int i = 0; i < 5; i++) {
-      if (!playerCells.contains(i * 5 + i)) {
-        hasMainDiagonalWin = false;
-        break;
-      }
+    final mainDiag = [0, 6, 12, 18, 24];
+    if (mainDiag.every((cell) => playerCells.contains(cell))) {
+      return WinningLine(
+        type: WinLineType.mainDiagonal,
+        index: 0,
+        cellIndices: mainDiag,
+      );
     }
-    if (hasMainDiagonalWin) return true;
 
     // Check anti-diagonal (top-right to bottom-left)
-    bool hasAntiDiagonalWin = true;
-    for (int i = 0; i < 5; i++) {
-      if (!playerCells.contains(i * 5 + (4 - i))) {
-        hasAntiDiagonalWin = false;
-        break;
-      }
+    final antiDiag = [4, 8, 12, 16, 20];
+    if (antiDiag.every((cell) => playerCells.contains(cell))) {
+      return WinningLine(
+        type: WinLineType.antiDiagonal,
+        index: 0,
+        cellIndices: antiDiag,
+      );
     }
-    if (hasAntiDiagonalWin) return true;
 
-    return false;
+    return null;
   }
 
   bool _checkDraw() {
     return !gameBoard.contains(null) ||
-        questions.every((q) => q["isAnswer"] == true);
+        (gameQuestions.isNotEmpty &&
+            gameQuestions.every((q) => q["isAnswer"] == true));
   }
 
   void _determineWinnerByPoints() {
@@ -478,13 +555,35 @@ class _HomePageState extends State<HomePage> {
                   padding: const EdgeInsets.all(20),
                   child: Column(
                     children: [
-                      Text(
-                        "المسابقة الوطنية للمعلومات",
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 24,
-                          fontWeight: FontWeight.bold,
-                        ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Text(
+                            "المسابقة الوطنية للمعلومات",
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 24,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(width: 14),
+                          ElevatedButton.icon(
+                            onPressed: _openQuestionsPage,
+                            icon: const Icon(Icons.table_chart, size: 18),
+                            label: Text(
+                              'بنك الأسئلة (${gameQuestions.length})',
+                              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.white.withValues(alpha: 0.95),
+                              foregroundColor: const Color(0xFF2E7D32),
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 5),
                       if (gameState == GameState.playing)
@@ -613,20 +712,42 @@ class _HomePageState extends State<HomePage> {
                             maxWidth: 500,
                             maxHeight: 500,
                           ),
-                          child: GridView.builder(
-                            shrinkWrap: true,
-                            physics: const NeverScrollableScrollPhysics(),
-                            gridDelegate:
-                                const SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: 5,
-                                  childAspectRatio: 1,
-                                  mainAxisSpacing: 4,
-                                  crossAxisSpacing: 4,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              GridView.builder(
+                                shrinkWrap: true,
+                                physics: const NeverScrollableScrollPhysics(),
+                                gridDelegate:
+                                    const SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: 5,
+                                      childAspectRatio: 1,
+                                      mainAxisSpacing: 4,
+                                      crossAxisSpacing: 4,
+                                    ),
+                                itemCount: 25,
+                                itemBuilder: (context, index) {
+                                  return _buildGameCell(index);
+                                },
+                              ),
+                              if (winningLine != null && _lineAnimation != null)
+                                Positioned.fill(
+                                  child: IgnorePointer(
+                                    child: AnimatedBuilder(
+                                      animation: _lineAnimation!,
+                                      builder: (context, child) {
+                                        return CustomPaint(
+                                          painter: WinningLinePainter(
+                                            winningLine: winningLine!,
+                                            progress: _lineAnimation!.value,
+                                            winner: winner,
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
                                 ),
-                            itemCount: 25,
-                            itemBuilder: (context, index) {
-                              return _buildGameCell(index);
-                            },
+                            ],
                           ),
                         ),
                       ),
@@ -661,10 +782,10 @@ class _HomePageState extends State<HomePage> {
                       ElevatedButton(
                         onPressed: _startNewGame,
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.white.withOpacity(0.9),
+                          backgroundColor: Colors.white.withValues(alpha: 0.9),
                           foregroundColor: Colors.black87,
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 30,
+                            horizontal: 25,
                             vertical: 15,
                           ),
                           shape: RoundedRectangleBorder(
@@ -674,6 +795,25 @@ class _HomePageState extends State<HomePage> {
                         child: const Text(
                           'لعبة جديدة',
                           style: TextStyle(fontSize: 16),
+                        ),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: _openQuestionsPage,
+                        icon: const Icon(Icons.upload_file, size: 20),
+                        label: const Text(
+                          'استيراد Excel / بنك الأسئلة',
+                          style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white.withValues(alpha: 0.95),
+                          foregroundColor: const Color(0xFF2E7D32),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 15,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(25),
+                          ),
                         ),
                       ),
                       Text(
@@ -740,6 +880,7 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildGameCell(int index) {
     final cellOwner = gameBoard[index];
+    final isWinningCell = winningLine?.cellIndices.contains(index) ?? false;
 
     return GestureDetector(
       onTap: () {
@@ -758,12 +899,22 @@ class _HomePageState extends State<HomePage> {
               ? Colors.blue.withOpacity(0.8)
               : Colors.red.withOpacity(0.8),
           borderRadius: BorderRadius.circular(15),
+          border: isWinningCell
+              ? Border.all(color: Colors.amberAccent, width: 3.5)
+              : null,
           boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.2),
-              blurRadius: 8,
-              offset: const Offset(0, 4),
-            ),
+            if (isWinningCell)
+              BoxShadow(
+                color: Colors.amber.withValues(alpha: 0.6),
+                blurRadius: 14,
+                spreadRadius: 2,
+              )
+            else
+              BoxShadow(
+                color: Colors.black.withOpacity(0.2),
+                blurRadius: 8,
+                offset: const Offset(0, 4),
+              ),
           ],
         ),
         child: Center(
@@ -777,15 +928,114 @@ class _HomePageState extends State<HomePage> {
                 )
               : Text(
                   cellOwner == Player.player1 ? 'X' : 'O',
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 35,
                     fontWeight: FontWeight.bold,
-                    color: Colors.white,
+                    color: isWinningCell ? Colors.amberAccent : Colors.white,
+                    shadows: isWinningCell
+                        ? const [
+                            Shadow(
+                              color: Colors.black45,
+                              blurRadius: 6,
+                              offset: Offset(1, 2),
+                            ),
+                          ]
+                        : null,
                   ),
                 ),
         ),
       ),
     );
+  }
+}
+
+class WinningLinePainter extends CustomPainter {
+  final WinningLine winningLine;
+  final double progress;
+  final Player? winner;
+
+  WinningLinePainter({
+    required this.winningLine,
+    required this.progress,
+    this.winner,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (progress <= 0.0) return;
+
+    const double spacing = 4.0;
+    final double cellWidth = (size.width - spacing * 4) / 5;
+    final double cellHeight = (size.height - spacing * 4) / 5;
+
+    double cellCenterX(int col) => col * (cellWidth + spacing) + cellWidth / 2;
+    double cellCenterY(int row) => row * (cellHeight + spacing) + cellHeight / 2;
+
+    Offset p1;
+    Offset p2;
+
+    switch (winningLine.type) {
+      case WinLineType.horizontal:
+        final row = winningLine.index;
+        p1 = Offset(cellCenterX(0), cellCenterY(row));
+        p2 = Offset(cellCenterX(4), cellCenterY(row));
+        break;
+      case WinLineType.vertical:
+        final col = winningLine.index;
+        p1 = Offset(cellCenterX(col), cellCenterY(0));
+        p2 = Offset(cellCenterX(col), cellCenterY(4));
+        break;
+      case WinLineType.mainDiagonal:
+        p1 = Offset(cellCenterX(0), cellCenterY(0));
+        p2 = Offset(cellCenterX(4), cellCenterY(4));
+        break;
+      case WinLineType.antiDiagonal:
+        p1 = Offset(cellCenterX(4), cellCenterY(0));
+        p2 = Offset(cellCenterX(0), cellCenterY(4));
+        break;
+    }
+
+    final delta = p2 - p1;
+    final distance = delta.distance;
+    final direction = distance > 0 ? delta / distance : Offset.zero;
+    final extension = cellWidth * 0.38;
+
+    final startPoint = p1 - direction * extension;
+    final fullEndPoint = p2 + direction * extension;
+    final currentEnd =
+        Offset.lerp(startPoint, fullEndPoint, progress) ?? fullEndPoint;
+
+    // Outer glow
+    final glowPaint = Paint()
+      ..color = Colors.amber.withValues(alpha: 0.45)
+      ..strokeWidth = 18.0
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    // Main line (Championship Gold)
+    final mainPaint = Paint()
+      ..color = const Color(0xFFFFD700)
+      ..strokeWidth = 10.0
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    // Inner highlight
+    final innerPaint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 3.5
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    canvas.drawLine(startPoint, currentEnd, glowPaint);
+    canvas.drawLine(startPoint, currentEnd, mainPaint);
+    canvas.drawLine(startPoint, currentEnd, innerPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant WinningLinePainter oldDelegate) {
+    return oldDelegate.progress != progress ||
+        oldDelegate.winningLine != winningLine ||
+        oldDelegate.winner != winner;
   }
 }
 
